@@ -1,0 +1,56 @@
+name: IaC Gate (Security + Cost)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      INFRACOST_CURRENCY: EUR
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python (for the gate script)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Checkov (IaC misconfig scanner)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "checkov==3.*"
+
+      - name: Run Checkov (JSON report)
+        run: |
+          mkdir -p results
+          checkov -d infra -o json > results/checkov.json || true
+
+      - name: Set up Infracost CLI
+        uses: infracost/actions/setup@v3
+        
+
+      - name: Run Infracost (HCL mode, no plan needed)
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+        run: |
+          infracost breakdown --path infra --format json --out-file results/infracost.json
+
+      - name: "Gate: fail or pass based on results"
+        run: |
+          python .github/scripts/gate.py \
+            --checkov results/checkov.json \
+            --infracost results/infracost.json \
+            --cost-warn 100 \
+            --cost-block 300
+
+      - name: Upload artifacts (for audit / demo)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: iac-gate-artifacts
+          path: results
