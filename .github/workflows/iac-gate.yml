@@ -13,6 +13,7 @@ jobs:
     env:
       INFRACOST_CURRENCY: EUR
       IAC_PATH: infracost         # TF code lives in infracost/
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
 
     steps:
       - name: Checkout PR branch
@@ -33,35 +34,22 @@ jobs:
           mkdir -p results
           checkov -d "$IAC_PATH" -o json | tee results/checkov.json || true
 
-      # Detect if the secret is available (same-repo PR)
-      - name: Detect secret presence
-        run: |
-          if [ -n "${INFRACOST_API_KEY:-}" ]; then
-            echo "HAS_INFRACOST=true" >> "$GITHUB_ENV"
-            echo "Secret present: using real Infracost."
-          else
-            echo "HAS_INFRACOST=false" >> "$GITHUB_ENV"
-            echo "No secret (fork or missing): will write fallback JSON & skip comment."
-          fi
-        env:
-          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
-
-      # Install CLI when secret is present
+      # Install Infracost CLI only when secret is present
       - name: Setup Infracost
-        if: ${{ env.HAS_INFRACOST == 'true' }}
+        if: ${{ env.INFRACOST_API_KEY != '' }}
         uses: infracost/actions/setup@v3
         with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
+          api-key: ${{ env.INFRACOST_API_KEY }}
 
       # === BASELINE (base branch) ===
       - name: Checkout base branch
-        if: ${{ env.HAS_INFRACOST == 'true' }}
+        if: ${{ env.INFRACOST_API_KEY != '' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.ref }}
 
       - name: Generate BASELINE breakdown (base)
-        if: ${{ env.HAS_INFRACOST == 'true' }}
+        if: ${{ env.INFRACOST_API_KEY != '' }}
         run: |
           mkdir -p results
           if [ -d "$IAC_PATH" ]; then
@@ -73,19 +61,19 @@ jobs:
 
       # === PR breakdown ===
       - name: Checkout PR branch again
-        if: ${{ env.HAS_INFRACOST == 'true' }}
+        if: ${{ env.INFRACOST_API_KEY != '' }}
         uses: actions/checkout@v4
 
       - name: Generate PR breakdown
-        if: ${{ env.HAS_INFRACOST == 'true' }}
+        if: ${{ env.INFRACOST_API_KEY != '' }}
         run: |
           mkdir -p results
           infracost breakdown --path "$IAC_PATH" \
                               --format json --out-file results/infracost_pr.json
 
-      # Create a diff JSON from the two breakdowns (nice artifact and used for comment)
+      # Create a diff JSON from the two breakdowns (artifact + for comment)
       - name: Generate Infracost diff JSON
-        if: ${{ env.HAS_INFRACOST == 'true' }}
+        if: ${{ env.INFRACOST_API_KEY != '' }}
         run: |
           infracost diff --path "$IAC_PATH" \
                          --format json \
@@ -98,7 +86,7 @@ jobs:
 
       # Post PR comment with the diff JSON
       - name: Post Infracost PR comment
-        if: ${{ env.HAS_INFRACOST == 'true' }}
+        if: ${{ env.INFRACOST_API_KEY != '' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -109,9 +97,9 @@ jobs:
             --pull-request ${{ github.event.pull_request.number }} \
             --behavior new
 
-      # Fallback JSONs if the secret isn't available, so the gate still runs
+      # Fallback ONLY when there is NO secret (forked PRs, etc.)
       - name: Fallback cost = 0 (no secret)
-        if: ${{ env.HAS_INFRACOST != 'true' }}
+        if: ${{ env.INFRACOST_API_KEY == '' }}
         run: |
           mkdir -p results
           echo '{"summary":{"totalMonthlyCost":"0"}}' > results/infracost_base.json
@@ -124,12 +112,12 @@ jobs:
           import json
           def tot(p):
               try:
-                  v=json.load(open(p)).get("summary",{}).get("totalMonthlyCost",0) or 0
+                  v = json.load(open(p)).get("summary",{}).get("totalMonthlyCost",0) or 0
                   return float(str(v).replace(",",""))
               except Exception:
                   return 0.0
-          base=tot("results/infracost_base.json")
-          pr=tot("results/infracost_pr.json")
+          base = tot("results/infracost_base.json")
+          pr = tot("results/infracost_pr.json")
           print("BASE total €:", base)
           print("PR   total €:", pr)
           print("DELTA      €:", pr-base)
