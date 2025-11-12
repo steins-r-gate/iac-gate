@@ -102,10 +102,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           infracost comment github --path results/infracost.json \
-                                   --repo $GITHUB_REPOSITORY \
-                                   --github-token "$GITHUB_TOKEN" \
-                                   --pull-request ${{ github.event.pull_request.number }} \
-                                   --behavior update
+                                  --repo $GITHUB_REPOSITORY \
+                                  --github-token "$GITHUB_TOKEN" \
+                                  --pull-request ${{ github.event.pull_request.number }} \
+                                  --behavior new
+
 
       # Fallback JSON if the secret isn't available, so the gate still runs
       - name: Fallback cost = 0 (no secret)
