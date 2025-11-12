@@ -9,10 +9,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write   # needed for the Infracost comment step
+      pull-requests: write   # needed so Infracost can post a PR comment
     env:
       INFRACOST_CURRENCY: EUR
-      IAC_PATH: infracost     # <<-- your folder (change to infra if needed)
+      IAC_PATH: infracost     # change to 'infra' if that’s your folder
 
     steps:
       - name: Checkout
@@ -36,7 +36,6 @@ jobs:
       - name: Set up Infracost CLI
         uses: infracost/actions/setup@v3
 
-      # Debug so you can see if secrets are available & if PR is from a fork
       - name: Debug (secret presence & fork)
         run: |
           echo "fork? = ${{ github.event.pull_request.head.repo.fork }}"
@@ -64,15 +63,17 @@ jobs:
             echo "HAS_INFRACOST=false" >> "$GITHUB_ENV"
           fi
 
-      # This creates the separate "Infracost" check so it won't be "Skipped"
-      - name: Infracost PR comment/check
+      # ✅ Correct action for posting the PR comment/check
+      - name: Post Infracost PR comment
         if: ${{ env.HAS_INFRACOST == 'true' }}
-        uses: infracost/actions/comment@v3
+        uses: infracost/actions@v3
         env:
           INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          post: comment
           path: results/infracost.json
-          behavior: update
+          behavior: update          # update existing comment instead of spamming
           fail-on-error: false
 
       - name: "Gate: fail or pass based on results"
@@ -84,8 +85,8 @@ jobs:
             --cost-block 300
 
       - name: Upload artifacts (for audit / demo)
-        uses: actions/upload-artifact@v4
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: iac-gate-artifacts
           path: results
