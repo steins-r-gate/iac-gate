@@ -1,0 +1,152 @@
+name: IaC Gate (Security + Cost)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write        # needed for CLI PR comment
+    env:
+      INFRACOST_CURRENCY: EUR
+      IAC_PATH: infracost         # TF code lives in infracost/
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Checkov
+        run: |
+          python -m pip install --upgrade pip
+          pip install "checkov==3.*"
+
+      - name: Run Checkov (JSON report)
+        run: |
+          mkdir -p results
+          checkov -d "$IAC_PATH" -o json | tee results/checkov.json || true
+
+      # Detect if the secret is available (same-repo PR)
+      - name: Detect secret presence
+        run: |
+          if [ -n "${INFRACOST_API_KEY:-}" ]; then
+            echo "HAS_INFRACOST=true" >> "$GITHUB_ENV"
+            echo "Secret present: using real Infracost."
+          else
+            echo "HAS_INFRACOST=false" >> "$GITHUB_ENV"
+            echo "No secret (fork or missing): will write fallback JSON & skip comment."
+          fi
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+      # Install CLI when secret is present
+      - name: Setup Infracost
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      # === BASELINE (base branch) ===
+      - name: Checkout base branch
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Generate BASELINE breakdown (base)
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        run: |
+          mkdir -p results
+          if [ -d "$IAC_PATH" ]; then
+            infracost breakdown --path "$IAC_PATH" \
+                                --format json --out-file results/infracost_base.json
+          else
+            echo '{"summary":{"totalMonthlyCost":"0"}}' > results/infracost_base.json
+          fi
+
+      # === PR breakdown ===
+      - name: Checkout PR branch again
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Generate PR breakdown
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        run: |
+          mkdir -p results
+          infracost breakdown --path "$IAC_PATH" \
+                              --format json --out-file results/infracost_pr.json
+
+      # Create a diff JSON from the two breakdowns (nice artifact and used for comment)
+      - name: Generate Infracost diff JSON
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        run: |
+          infracost diff --path "$IAC_PATH" \
+                         --format json \
+                         --compare-to results/infracost_base.json \
+                         --out-file results/infracost.json || true
+          # Ensure a file exists even if 'diff' fails for some reason
+          if [ ! -s results/infracost.json ]; then
+            cp results/infracost_pr.json results/infracost.json
+          fi
+
+      # Post PR comment with the diff JSON
+      - name: Post Infracost PR comment
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          infracost comment github \
+            --path results/infracost.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --github-token "$GITHUB_TOKEN" \
+            --pull-request ${{ github.event.pull_request.number }} \
+            --behavior new
+
+      # Fallback JSONs if the secret isn't available, so the gate still runs
+      - name: Fallback cost = 0 (no secret)
+        if: ${{ env.HAS_INFRACOST != 'true' }}
+        run: |
+          mkdir -p results
+          echo '{"summary":{"totalMonthlyCost":"0"}}' > results/infracost_base.json
+          echo '{"summary":{"totalMonthlyCost":"0"}}' > results/infracost_pr.json
+          echo '{"summary":{"diffTotalMonthlyCost":"0"}}' > results/infracost.json
+
+      - name: "Debug: show base/pr totals and delta"
+        run: |
+          python - <<'PY'
+          import json
+          def tot(p):
+              try:
+                  v=json.load(open(p)).get("summary",{}).get("totalMonthlyCost",0) or 0
+                  return float(str(v).replace(",",""))
+              except Exception:
+                  return 0.0
+          base=tot("results/infracost_base.json")
+          pr=tot("results/infracost_pr.json")
+          print("BASE total €:", base)
+          print("PR   total €:", pr)
+          print("DELTA      €:", pr-base)
+          PY
+
+      - name: "Gate: fail or pass based on results"
+        run: |
+          python .github/scripts/gate.py \
+            --checkov results/checkov.json \
+            --infracost results/infracost_pr.json \
+            --infracost-base results/infracost_base.json \
+            --cost-warn 100 \
+            --cost-block 300
+
+      - name: Upload artifacts (for audit / demo)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iac-gate-artifacts
+          path: results
