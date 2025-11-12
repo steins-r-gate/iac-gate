@@ -96,18 +96,20 @@ jobs:
             cp results/infracost_pr.json results/infracost.json
           fi
 
-      # ✅ Post PR comment with the diff JSON — NO --compare-to here
+      # ✅ Post Infracost PR comment (guaranteed new comment)
       - name: Post Infracost PR comment
         if: ${{ env.HAS_INFRACOST == 'true' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}   # <-- use github.token, not secrets.GITHUB_TOKEN
         run: |
+          echo "Posting Infracost PR comment..."
           infracost comment github \
             --path results/infracost.json \
-            --repo $GITHUB_REPOSITORY \
+            --repo "$GITHUB_REPOSITORY" \
             --github-token "$GITHUB_TOKEN" \
             --pull-request ${{ github.event.pull_request.number }} \
-            --behavior update
+            --behavior new
+
 
       # Fallback JSONs if the secret isn't available, so the gate still runs
       - name: Fallback cost = 0 (no secret)
