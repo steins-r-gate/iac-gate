@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write        # needed for CLI comment
+      pull-requests: write        # needed for CLI PR comment
     env:
       INFRACOST_CURRENCY: EUR
       IAC_PATH: infracost         # change to 'infra' if that's your folder
@@ -53,83 +53,95 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      # === Build a baseline from the base branch (may not exist on early PRs) ===
+      # === Build BASELINE (base branch) ===
       - name: Checkout base branch
         if: ${{ env.HAS_INFRACOST == 'true' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.ref }}
 
-      - name: Generate baseline (breakdown)
+      - name: Generate BASELINE breakdown (base)
         if: ${{ env.HAS_INFRACOST == 'true' }}
         run: |
+          mkdir -p results
           if [ -d "$IAC_PATH" ]; then
             infracost breakdown --path "$IAC_PATH" \
-                                --format json --out-file /tmp/infracost-base.json
+                                --format json --out-file results/infracost_base.json
           else
-            echo "Base branch has no $IAC_PATH/; skipping baseline."
-            echo '{"projects":[],"summary":{"totalMonthlyCost":"0"}}' > /tmp/infracost-base.json
+            echo "Base branch has no $IAC_PATH/; using zero baseline."
+            echo '{"summary":{"totalMonthlyCost":"0"}}' > results/infracost_base.json
           fi
 
-      # Back to PR branch to produce diff
+      # === Build PR breakdown (current PR branch) ===
       - name: Checkout PR branch again
         if: ${{ env.HAS_INFRACOST == 'true' }}
         uses: actions/checkout@v4
 
-      - name: Generate Infracost diff JSON (or fallback to breakdown)
+      - name: Generate PR breakdown
         if: ${{ env.HAS_INFRACOST == 'true' }}
         run: |
           mkdir -p results
-          set -e
-          # Try diff first
-          if [ -d "$IAC_PATH" ] && [ -s /tmp/infracost-base.json ]; then
-            infracost diff --path "$IAC_PATH" \
-                           --format json \
-                           --compare-to /tmp/infracost-base.json \
-                           --out-file results/infracost.json || true
-          fi
-          # If diff file missing/empty, fall back to a breakdown JSON so we can still comment
+          infracost breakdown --path "$IAC_PATH" \
+                              --format json --out-file results/infracost_pr.json
+
+      # Optional: also write a diff JSON (nice to have as an artifact)
+      - name: Generate Infracost diff JSON (from two breakdowns)
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        run: |
+          infracost diff --path "$IAC_PATH" \
+                         --format json \
+                         --compare-to results/infracost_base.json \
+                         --out-file results/infracost.json || true
+          # Ensure a file exists even if 'diff' fails for some reason
           if [ ! -s results/infracost.json ]; then
-            echo "No diff JSON produced; falling back to breakdown."
-            infracost breakdown --path "$IAC_PATH" \
-                                --format json --out-file results/infracost.json
+            cp results/infracost_pr.json results/infracost.json
           fi
 
-      # Post PR comment via CLI (only when we have the secret)
+      # Post PR comment via CLI (uses the two breakdowns)
       - name: Post Infracost PR comment
         if: ${{ env.HAS_INFRACOST == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          infracost comment github --path results/infracost.json \
-                                  --repo $GITHUB_REPOSITORY \
-                                  --github-token "$GITHUB_TOKEN" \
-                                  --pull-request ${{ github.event.pull_request.number }} \
-                                  --behavior new
+          infracost comment github \
+            --path results/infracost_pr.json \
+            --compare-to results/infracost_base.json \
+            --repo $GITHUB_REPOSITORY \
+            --github-token "$GITHUB_TOKEN" \
+            --pull-request ${{ github.event.pull_request.number }} \
+            --behavior update
 
-      - name: "Debug: show Infracost summary"
-        run: |
-          python - <<'PY'
-          import json
-          d=json.load(open('results/infracost.json'))
-          s=d.get('summary',{})
-          print("diffTotalMonthlyCost =", s.get('diffTotalMonthlyCost'))
-          print("totalMonthlyCost     =", s.get('totalMonthlyCost'))
-          PY
-          
-            
-      # Fallback JSON if the secret isn't available, so the gate still runs
+      # Fallback JSONs if the secret isn't available, so the gate still runs
       - name: Fallback cost = 0 (no secret)
         if: ${{ env.HAS_INFRACOST != 'true' }}
         run: |
           mkdir -p results
+          echo '{"summary":{"totalMonthlyCost":"0"}}' > results/infracost_base.json
+          echo '{"summary":{"totalMonthlyCost":"0"}}' > results/infracost_pr.json
           echo '{"summary":{"diffTotalMonthlyCost":"0"}}' > results/infracost.json
+
+      - name: "Debug: show base/pr totals and delta"
+        run: |
+          python - <<'PY'
+          import json, os
+          def tot(p):
+            try:
+              v=json.load(open(p)).get("summary",{}).get("totalMonthlyCost",0) or 0
+              return float(str(v).replace(",",""))
+            except Exception: return 0.0
+          base=tot("results/infracost_base.json")
+          pr=tot("results/infracost_pr.json")
+          print("BASE total €:", base)
+          print("PR   total €:", pr)
+          print("DELTA      €:", pr-base)
+          PY
 
       - name: "Gate: fail or pass based on results"
         run: |
           python .github/scripts/gate.py \
             --checkov results/checkov.json \
-            --infracost results/infracost.json \
+            --infracost results/infracost_pr.json \
+            --infracost-base results/infracost_base.json \
             --cost-warn 100 \
             --cost-block 300
 
