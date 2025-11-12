@@ -9,13 +9,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write   # needed so Infracost can post a PR comment
+      pull-requests: write   # needed to post PR comments (CLI uses GITHUB_TOKEN)
     env:
       INFRACOST_CURRENCY: EUR
-      IAC_PATH: infracost     # change to 'infra' if that’s your folder
+      IAC_PATH: infracost     # change to 'infra' if that's your folder
 
     steps:
-      - name: Checkout
+      - name: Checkout PR branch
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -33,48 +33,72 @@ jobs:
           mkdir -p results
           checkov -d "$IAC_PATH" -o json | tee results/checkov.json || true
 
-      - name: Set up Infracost CLI
-        uses: infracost/actions/setup@v3
-
-      - name: Debug (secret presence & fork)
+      # Detect if the secret is available (same-repo PR) and export a flag
+      - name: Detect secret presence
         run: |
-          echo "fork? = ${{ github.event.pull_request.head.repo.fork }}"
           if [ -n "${INFRACOST_API_KEY:-}" ]; then
-            echo "INFRACOST_API_KEY is set"
+            echo "HAS_INFRACOST=true" >> "$GITHUB_ENV"
+            echo "Secret present: using real Infracost."
           else
-            echo "INFRACOST_API_KEY is NOT set"
+            echo "HAS_INFRACOST=false" >> "$GITHUB_ENV"
+            echo "No secret (fork or missing): will write fallback JSON."
           fi
         env:
           INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: Run Infracost (HCL mode)
-        env:
-          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
-          INFRACOST_CURRENCY: EUR
+      # Setup Infracost only when the secret is present
+      - name: Setup Infracost
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      # Baseline from the base branch (main/master)
+      - name: Checkout base branch
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Generate baseline (breakdown)
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        run: |
+          infracost breakdown --path "$IAC_PATH" \
+                              --format json \
+                              --out-file /tmp/infracost-base.json
+
+      # Back to PR branch to generate the diff
+      - name: Checkout PR branch again
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Generate Infracost diff JSON
+        if: ${{ env.HAS_INFRACOST == 'true' }}
         run: |
           mkdir -p results
-          if [ -n "${INFRACOST_API_KEY:-}" ]; then
-            echo "Running Infracost with real key"
-            infracost breakdown --path "$IAC_PATH" --format json --out-file results/infracost.json
-            echo "HAS_INFRACOST=true" >> "$GITHUB_ENV"
-          else
-            echo "No key (fork or missing). Writing fallback cost=0 JSON."
-            echo '{"summary":{"diffTotalMonthlyCost":"0"}}' > results/infracost.json
-            echo "HAS_INFRACOST=false" >> "$GITHUB_ENV"
-          fi
+          infracost diff --path "$IAC_PATH" \
+                         --format json \
+                         --compare-to /tmp/infracost-base.json \
+                         --out-file results/infracost.json
 
-      # ✅ Correct action for posting the PR comment/check
+      # Post PR comment using the CLI (not a separate "comment action")
       - name: Post Infracost PR comment
         if: ${{ env.HAS_INFRACOST == 'true' }}
-        uses: infracost/actions@v3
         env:
-          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          post: comment
-          path: results/infracost.json
-          behavior: update          # update existing comment instead of spamming
-          fail-on-error: false
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          infracost comment github --path results/infracost.json \
+                                   --repo $GITHUB_REPOSITORY \
+                                   --github-token $GITHUB_TOKEN \
+                                   --pull-request ${{ github.event.pull_request.number }} \
+                                   --behavior update
+
+      # Fallback JSON if secret isn't available so the gate still runs
+      - name: Fallback cost = 0 (no secret)
+        if: ${{ env.HAS_INFRACOST != 'true' }}
+        run: |
+          mkdir -p results
+          echo '{"summary":{"diffTotalMonthlyCost":"0"}}' > results/infracost.json
 
       - name: "Gate: fail or pass based on results"
         run: |
