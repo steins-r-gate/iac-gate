@@ -53,7 +53,7 @@ jobs:
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      # === Build BASELINE (base branch) ===
+      # === BASELINE (base branch) ===
       - name: Checkout base branch
         if: ${{ env.HAS_INFRACOST == 'true' }}
         uses: actions/checkout@v4
@@ -68,11 +68,10 @@ jobs:
             infracost breakdown --path "$IAC_PATH" \
                                 --format json --out-file results/infracost_base.json
           else
-            echo "Base branch has no $IAC_PATH/; using zero baseline."
             echo '{"summary":{"totalMonthlyCost":"0"}}' > results/infracost_base.json
           fi
 
-      # === Build PR breakdown (current PR branch) ===
+      # === PR breakdown ===
       - name: Checkout PR branch again
         if: ${{ env.HAS_INFRACOST == 'true' }}
         uses: actions/checkout@v4
@@ -84,8 +83,8 @@ jobs:
           infracost breakdown --path "$IAC_PATH" \
                               --format json --out-file results/infracost_pr.json
 
-      # Optional: also write a diff JSON (nice to have as an artifact)
-      - name: Generate Infracost diff JSON (from two breakdowns)
+      # Create a diff JSON from the two breakdowns (nice artifact and used for comment)
+      - name: Generate Infracost diff JSON
         if: ${{ env.HAS_INFRACOST == 'true' }}
         run: |
           infracost diff --path "$IAC_PATH" \
@@ -97,15 +96,14 @@ jobs:
             cp results/infracost_pr.json results/infracost.json
           fi
 
-      # Post PR comment via CLI (uses the two breakdowns)
+      # ✅ Post PR comment with the diff JSON — NO --compare-to here
       - name: Post Infracost PR comment
         if: ${{ env.HAS_INFRACOST == 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           infracost comment github \
-            --path results/infracost_pr.json \
-            --compare-to results/infracost_base.json \
+            --path results/infracost.json \
             --repo $GITHUB_REPOSITORY \
             --github-token "$GITHUB_TOKEN" \
             --pull-request ${{ github.event.pull_request.number }} \
@@ -123,7 +121,7 @@ jobs:
       - name: "Debug: show base/pr totals and delta"
         run: |
           python - <<'PY'
-          import json, os
+          import json
           def tot(p):
             try:
               v=json.load(open(p)).get("summary",{}).get("totalMonthlyCost",0) or 0
