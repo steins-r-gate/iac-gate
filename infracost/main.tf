@@ -48,3 +48,13 @@ resource "aws_instance" "demo" {
 
 # Make sure you have a provider region so Infracost can price:
 provider "aws" { region = "eu-west-1" }
+
+# Big EBS volume to create obvious monthly cost
+resource "aws_ebs_volume" "cost_demo" {
+  availability_zone = "eu-west-1a"
+  size              = 500  # GB
+  type              = "gp3"
+  iops              = 3000
+  throughput        = 125
+  tags = { Name = "CostDemoVolume" }
+}

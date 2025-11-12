@@ -107,7 +107,17 @@ jobs:
                                   --pull-request ${{ github.event.pull_request.number }} \
                                   --behavior new
 
-
+      - name: "Debug: show Infracost summary"
+        run: |
+          python - <<'PY'
+          import json
+          d=json.load(open('results/infracost.json'))
+          s=d.get('summary',{})
+          print("diffTotalMonthlyCost =", s.get('diffTotalMonthlyCost'))
+          print("totalMonthlyCost     =", s.get('totalMonthlyCost'))
+          PY
+          
+            
       # Fallback JSON if the secret isn't available, so the gate still runs
       - name: Fallback cost = 0 (no secret)
         if: ${{ env.HAS_INFRACOST != 'true' }}
