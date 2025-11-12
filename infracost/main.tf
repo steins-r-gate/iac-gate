@@ -17,6 +17,8 @@ resource "aws_s3_bucket_public_access_block" "demo" {
   restrict_public_buckets = false
 }
 
+
+
 resource "aws_s3_bucket_policy" "public" {
   bucket = aws_s3_bucket.demo.id
   policy = jsonencode({
@@ -31,9 +33,18 @@ resource "aws_s3_bucket_policy" "public" {
   })
 }
 
-# EC2 to produce a visible monthly cost signal
+# Public S3 ACL (legacy + risky) – HIGH
+resource "aws_s3_bucket_acl" "public_acl" {
+  bucket = aws_s3_bucket.demo.id
+  acl    = "public-read"
+}
+
+# Change instance size (increases monthly cost)
 resource "aws_instance" "demo" {
-  ami           = "ami-12345678"   # placeholder; we won't apply
-  instance_type = "t3.large"
+  ami           = "ami-12345678"
+  instance_type = "m5.4xlarge"   # was t3.large
   tags = { Name = "DemoInstance" }
 }
+
+# Make sure you have a provider region so Infracost can price:
+provider "aws" { region = "eu-west-1" }
