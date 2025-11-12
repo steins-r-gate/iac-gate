@@ -7,10 +7,12 @@ on:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    permissions: { contents: read }
+    permissions:
+      contents: read
+      pull-requests: write   # needed for the Infracost comment step
     env:
       INFRACOST_CURRENCY: EUR
-      IAC_PATH: infracost    # <-- set your folder here (was infra)
+      IAC_PATH: infracost     # <<-- your folder (change to infra if needed)
 
     steps:
       - name: Checkout
@@ -18,7 +20,8 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+        with:
+          python-version: '3.11'
 
       - name: Install Checkov
         run: |
@@ -33,29 +36,56 @@ jobs:
       - name: Set up Infracost CLI
         uses: infracost/actions/setup@v3
 
-      - name: Run Infracost (HCL mode, no plan)
+      # Debug so you can see if secrets are available & if PR is from a fork
+      - name: Debug (secret presence & fork)
+        run: |
+          echo "fork? = ${{ github.event.pull_request.head.repo.fork }}"
+          if [ -n "${INFRACOST_API_KEY:-}" ]; then
+            echo "INFRACOST_API_KEY is set"
+          else
+            echo "INFRACOST_API_KEY is NOT set"
+          fi
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Run Infracost (HCL mode)
         env:
           INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
           INFRACOST_CURRENCY: EUR
         run: |
           mkdir -p results
-          if [ -z "$INFRACOST_API_KEY" ]; then
-            echo "No INFRACOST_API_KEY; writing fallback cost=0 JSON."
-            echo '{"summary":{"diffTotalMonthlyCost":"0"}}' > results/infracost.json
-          else
+          if [ -n "${INFRACOST_API_KEY:-}" ]; then
+            echo "Running Infracost with real key"
             infracost breakdown --path "$IAC_PATH" --format json --out-file results/infracost.json
+            echo "HAS_INFRACOST=true" >> "$GITHUB_ENV"
+          else
+            echo "No key (fork or missing). Writing fallback cost=0 JSON."
+            echo '{"summary":{"diffTotalMonthlyCost":"0"}}' > results/infracost.json
+            echo "HAS_INFRACOST=false" >> "$GITHUB_ENV"
           fi
 
-      - name: "Gate: fail or pass"
+      # This creates the separate "Infracost" check so it won't be "Skipped"
+      - name: Infracost PR comment/check
+        if: ${{ env.HAS_INFRACOST == 'true' }}
+        uses: infracost/actions/comment@v3
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+        with:
+          path: results/infracost.json
+          behavior: update
+          fail-on-error: false
+
+      - name: "Gate: fail or pass based on results"
         run: |
           python .github/scripts/gate.py \
             --checkov results/checkov.json \
             --infracost results/infracost.json \
-            --cost-warn 100 --cost-block 300
+            --cost-warn 100 \
+            --cost-block 300
 
-      - name: Upload artifacts
-        if: always()
+      - name: Upload artifacts (for audit / demo)
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: iac-gate-artifacts
           path: results
