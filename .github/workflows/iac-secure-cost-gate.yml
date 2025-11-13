@@ -73,13 +73,14 @@ jobs:
 
       - name: Post Infracost PR comment
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
         run: |
           infracost comment github \
             --path "$DIFF_JSON" \
             --repo "$GITHUB_REPOSITORY" \
             --pull-request "${{ github.event.pull_request.number }}" \
-            --behavior update
+            --behavior update \
+            --github-token "${{ github.token }}"
 
       # ----------- Ensure results dir before Checkov -----------
       - name: Ensure results dir exists
@@ -98,10 +99,8 @@ jobs:
           output_format: json,sarif
           output_file_path: ${{ env.CKV_JSON }}::${{ env.CKV_SARIF }}
         env:
-          # Optional: if you use Bridgecrew platform, add this secret
+          # Optional Bridgecrew SaaS token; OK if missing
           BC_API_KEY: ${{ secrets.BC_API_KEY }}
-          # Optional: skip specific checks (comma-separated)
-          # CHECKOV_SKIP_CHECK: CKV_AWS_20,CKV_AWS_52
 
       - name: Upload Checkov SARIF to code scanning
         uses: github/codeql-action/upload-sarif@v3
@@ -111,6 +110,7 @@ jobs:
 
       # ----------- Debug (optional) -----------
       - name: "Debug: Infracost tables"
+        if: always()
         run: |
           echo "=== BASELINE ==="
           infracost output --path "$BASE_JSON" --format table || true
@@ -122,6 +122,7 @@ jobs:
       # ----------- Gates -----------
       - name: Gate security (Checkov)
         id: gate_sec
+        if: always()
         continue-on-error: true
         run: |
           python .github/scripts/checkov_gate.py \
@@ -132,6 +133,7 @@ jobs:
 
       - name: Gate cost (Infracost)
         id: gate_cost
+        if: always()
         continue-on-error: true
         run: |
           python .github/scripts/gate.py \
