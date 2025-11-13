@@ -1,0 +1,154 @@
+name: IaC Secure + Cost Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+env:
+  IAC_PATH: .                       # change if your Terraform root is elsewhere
+  RESULTS_DIR: results
+  BASE_JSON: results/infracost_base.json
+  PR_JSON:   results/infracost_pr.json
+  DIFF_JSON: results/infracost_diff.json
+  CKV_JSON:  results/checkov.json
+  CKV_SARIF: results/checkov.sarif
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR (head) branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python (for gate scripts)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Set up Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Capture base/head SHAs
+        id: shas
+        run: |
+          echo "BASE_SHA=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          echo "HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+
+      # ----------- Infracost BASELINE (base branch) -----------
+      - name: Generate BASELINE breakdown (base)
+        run: |
+          git checkout "${{ steps.shas.outputs.BASE_SHA }}"
+          mkdir -p "$RESULTS_DIR"
+          infracost breakdown \
+            --path "$IAC_PATH" \
+            --format json \
+            --out-file "$BASE_JSON"
+
+      # ----------- Infracost PR (head branch) -----------
+      - name: Generate PR breakdown
+        run: |
+          git checkout "${{ steps.shas.outputs.HEAD_SHA }}"
+          mkdir -p "$RESULTS_DIR"
+          infracost breakdown \
+            --path "$IAC_PATH" \
+            --format json \
+            --out-file "$PR_JSON"
+
+      - name: Generate Infracost diff JSON
+        run: |
+          infracost diff \
+            --path "$IAC_PATH" \
+            --compare-to "$BASE_JSON" \
+            --format json \
+            --out-file "$DIFF_JSON"
+
+      - name: Post Infracost PR comment
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+        run: |
+          infracost comment github \
+            --path "$DIFF_JSON" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pull-request "${{ github.event.pull_request.number }}" \
+            --behavior update \
+            --github-token "${{ github.token }}"
+
+      # ----------- Ensure results dir before Checkov -----------
+      - name: Ensure results dir exists
+        run: mkdir -p "$RESULTS_DIR"
+
+      # ----------- Checkov security scan (head branch) -----------
+      - name: Run Checkov (Terraform)
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.IAC_PATH }}
+          framework: terraform
+          download_external_modules: true
+          quiet: true
+          soft_fail: true                   # don't fail here; we gate explicitly below
+          output_format: json,sarif
+          output_file_path: ${{ env.CKV_JSON }}::${{ env.CKV_SARIF }}
+        env:
+          # Optional Bridgecrew SaaS token; OK if missing
+          BC_API_KEY: ${{ secrets.BC_API_KEY }}
+
+      - name: Upload Checkov SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.CKV_SARIF }}
+          category: checkov
+
+      # ----------- Debug (optional) -----------
+      - name: "Debug: Infracost tables"
+        if: always()
+        run: |
+          echo "=== BASELINE ==="
+          infracost output --path "$BASE_JSON" --format table || true
+          echo "=== PR ==="
+          infracost output --path "$PR_JSON" --format table || true
+          echo "=== DIFF ==="
+          infracost output --path "$DIFF_JSON" --format table || true
+
+      # ----------- Gates -----------
+      - name: Gate security (Checkov)
+        id: gate_sec
+        if: always()
+        continue-on-error: true
+        run: |
+          python .github/scripts/checkov_gate.py \
+            --json "$CKV_JSON" \
+            --max-critical 0 \
+            --max-high 0 \
+            --max-medium 5
+
+      - name: Gate cost (Infracost)
+        id: gate_cost
+        if: always()
+        continue-on-error: true
+        run: |
+          python .github/scripts/gate.py \
+            --base "$BASE_JSON" \
+            --pr   "$PR_JSON" \
+            --diff "$DIFF_JSON" \
+            --abs-threshold 5.00 \
+            --pct-threshold 0.05
+
+      - name: Final gate (fail if any gate failed)
+        if: always()
+        run: |
+          echo "Checkov gate outcome:  ${{ steps.gate_sec.outcome }}"
+          echo "Infracost gate outcome:${{ steps.gate_cost.outcome }}"
+          if [ "${{ steps.gate_sec.outcome }}" != "success" ] || [ "${{ steps.gate_cost.outcome }}" != "success" ]; then
+            echo "Overall gate FAILED"; exit 1
+          fi
+          echo "Overall gate PASSED"
