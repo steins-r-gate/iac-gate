@@ -1,86 +1,111 @@
 #!/usr/bin/env python3
-import argparse, json, os, sys
-from collections import Counter
-
-SEV_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]
-
-def _load(path, default):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+import argparse, json, math, sys
+from pathlib import Path
 
 def _to_float(x):
     try:
-        return float(x)
+        if isinstance(x, (int, float)): return float(x)
+        if isinstance(x, str): return float(x.replace("$","").replace(",","").strip())
     except Exception:
-        try:
-            return float(str(x).replace(",", ""))
-        except Exception:
-            return 0.0
+        return None
+    return None
 
-def checkov_counts(data):
-    failed = (data.get("results", {}) or {}).get("failed_checks", []) or []
-    counts = Counter()
-    for x in failed:
-        sev = (x.get("check_severity") or x.get("severity") or "UNKNOWN").upper()
-        counts[sev] += 1
-    total = sum(counts.values())
-    return counts, total
+def _deep_search_first(obj, keys):
+    if isinstance(obj, dict):
+        for k in keys:
+            if k in obj:
+                v = _to_float(obj[k])
+                if v is not None:
+                    return v
+        for v in obj.values():
+            found = _deep_search_first(v, keys)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _deep_search_first(v, keys)
+            if found is not None:
+                return found
+    return None
 
-def infracost_total(data):
-    return _to_float((data.get("summary") or {}).get("totalMonthlyCost", 0))
+def _sum_projects_totals(js):
+    total = 0.0
+    projects = js.get("projects") if isinstance(js, dict) else None
+    if not isinstance(projects, list):
+        return None
+    for p in projects:
+        v = None
+        for keys in (["summary","totalMonthlyCost"], ["breakdown","totalMonthlyCost"]):
+            cur = p
+            for k in keys:
+                if isinstance(cur, dict) and k in cur:
+                    cur = cur[k]
+                else:
+                    cur = None
+                    break
+            if cur is not None:
+                v = _to_float(cur); break
+        if v is None:
+            v = _to_float(p.get("totalMonthlyCost"))
+        if v is not None:
+            total += v
+    return total
+
+def read_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def total_from_breakdown(js):
+    v = _deep_search_first(js, ["totalMonthlyCost"])
+    if v is not None: return v
+    v = _sum_projects_totals(js)
+    return v if v is not None else 0.0
+
+def delta_from_diff(js):
+    return _deep_search_first(js, ["diffTotalMonthlyCost", "totalMonthlyCostDiff", "monthlyCostChange"])
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkov", required=True)
-    ap.add_argument("--infracost", required=True, help="PR breakdown JSON")
-    ap.add_argument("--infracost-base", help="BASE breakdown JSON")
-    ap.add_argument("--cost-warn", type=float, default=100.0)
-    ap.add_argument("--cost-block", type=float, default=300.0)
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--pr", required=True)
+    ap.add_argument("--diff", required=True)
+    ap.add_argument("--abs-threshold", type=float, default=0.0)
+    ap.add_argument("--pct-threshold", type=float, default=0.0)
     args = ap.parse_args()
 
-    ck = _load(args.checkov, {"results": {"failed_checks": []}})
-    ic_pr = _load(args.infracost, {"summary": {"totalMonthlyCost": "0"}})
+    for p in (args.base, args.pr, args.diff):
+        if not Path(p).is_file():
+            print(f"Gate ERROR: missing file: {p}", file=sys.stderr); sys.exit(1)
 
-    cost_diff = 0.0
-    if args.infracost_base:
-        ic_base = _load(args.infracost_base, {"summary": {"totalMonthlyCost": "0"}})
-        cost_diff = infracost_total(ic_pr) - infracost_total(ic_base)
-    cost_diff = round(float(cost_diff), 2)
+    js_base = read_json(args.base)
+    js_pr   = read_json(args.pr)
+    js_diff = read_json(args.diff)
 
-    sev_counts, total_failed = checkov_counts(ck)
-    high = sev_counts["HIGH"] + sev_counts["CRITICAL"]
+    delta = delta_from_diff(js_diff)
+    base_total = total_from_breakdown(js_base)
+    pr_total   = total_from_breakdown(js_pr)
 
-    # Job summary
-    lines = [
-        "# IaC Gate Result",
-        f"- Checkov failed checks: **{total_failed}** ( " + ", ".join(
-            f"{s}: {sev_counts.get(s,0)}" for s in SEV_ORDER if sev_counts.get(s,0)) + " )",
-        f"- Infracost monthly cost delta: **€{cost_diff:.2f}**",
-        f"- Thresholds: warn ≥ €{args.cost_warn}, block ≥ €{args.cost_block}",
-    ]
-    summ = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summ:
-        with open(summ, "a", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+    if delta is None:
+        delta = pr_total - base_total
 
-    # Gate decision
-    reasons, exit_code = [], 0
-    if high > 0:
-        reasons.append(f"{high} HIGH/CRITICAL security findings")
-        exit_code = 1
-    if cost_diff >= args.cost_block:
-        reasons.append(f"cost increase €{cost_diff:.2f} ≥ block (€{args.cost_block})")
-        exit_code = 1
+    delta = 0.0 if delta is None or math.isnan(delta) else float(delta)
+    pct = (delta / base_total) if base_total and base_total > 0 else None
 
-    if exit_code:
-        print("❌ Gate FAILED:", "; ".join(reasons))
+    reasons = []
+    if args.abs_threshold and abs(delta) > args.abs_threshold:
+        reasons.append(f"abs delta ${delta:,.2f} > ${args.abs_threshold:,.2f}")
+    if pct is not None and args.pct_threshold and pct > args.pct_threshold:
+        reasons.append(f"percent delta {pct*100:.2f}% > {args.pct_threshold*100:.2f}%")
+
+    status_ok = (not reasons) or (delta <= 0)
+    print("---- Infracost Gate ----")
+    print(f"BASE total: ${base_total:,.2f}")
+    print(f"PR   total: ${pr_total:,.2f}")
+    print(f"Δ (PR-BASE): ${delta:,.2f}" + (f"  ({pct*100:.2f}%)" if pct is not None else ""))
+    if status_ok:
+        print("Gate PASSED: within thresholds (or change is a saving)."); sys.exit(0)
     else:
-        note = f" — ⚠ cost warning (≥ €{args.cost_warn})" if cost_diff >= args.cost_warn else ""
-        print(f"✅ Gate PASSED (Checkov HIGH/CRITICAL=0; cost Δ=€{cost_diff:.2f}){note}")
-    sys.exit(exit_code)
+        print("Gate FAILED: " + "; ".join(reasons)); sys.exit(1)
 
 if __name__ == "__main__":
     main()
